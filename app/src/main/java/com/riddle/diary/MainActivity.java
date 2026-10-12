@@ -171,10 +171,12 @@ public class MainActivity extends Activity implements DiaryView.Host {
         box.setPadding(pad, pad / 2, pad, 0);
 
         TextView hint = new TextView(this);
-        hint.setText("首次使用必须填写 API Base URL、API Key、Model（需支持图像输入），\n"
-            + "否则日记无法回信。写下字后停笔约 3 秒：日记吸墨，Tom 用花体回信。\n"
-            + "双指点按 = 橡皮擦。写下 \"show me …\" 召回旧页。");
+        hint.setText("填写 OpenAI 兼容的 API（需支持图像输入），日记才能回信。\n"
+            + "· 写字后停笔约 3 秒：日记吸墨，Tom 用花体回信\n"
+            + "· 双指点按 = 橡皮擦\n"
+            + "· 写 \"show me …\" 召回旧页");
         hint.setTextSize(13);
+        hint.setLineSpacing(0, 1.15f);
         hint.setPadding(0, 0, 0, pad / 2);
         box.addView(hint);
 

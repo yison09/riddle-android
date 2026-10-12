@@ -5,20 +5,28 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PointF;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
+import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.os.SystemClock;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -28,6 +36,12 @@ import java.util.concurrent.Executors;
  * to the oracle. Tom's reply writes itself back stroke by stroke in a
  * flowing hand, then fades away. A conjured memory page rises through the
  * paper in faded ink; touch to return.
+ *
+ * Rendering is layered into three off-screen bitmaps so each frame is O(1)
+ * w.r.t. how much has been written: bgBmp (paper, rules, margins), pageBmp
+ * (this round's committed user ink), replyBmp (settled reply ink). Only the
+ * stroke currently under the finger and the sentence currently being written
+ * are rebuilt as Paths each frame.
  */
 public class DiaryView extends View {
 
@@ -46,20 +60,32 @@ public class DiaryView extends View {
     private static final float MOVE_TOL_DP = 20f;
     private static final float PAGE_MAX_W = 1024f;
 
+    // --- paper layers (all rebuilt only on size change) ---
+    private Bitmap bgBmp;      // paper colour, grain, rules, gutter, holes, date
+    private Bitmap pageBmp;    // this round's user ink (settled strokes)
+    private Bitmap replyBmp;   // settled reply ink (fades as a whole)
+    private Canvas bgCv, pageCv, replyCv;
+    private boolean hasInk;    // pageBmp holds ink this round
+    private boolean hinted;    // empty-page hint already shown once
+
     // --- user ink ---
     private static final class Stroke {
         final List<PointF> pts = new ArrayList<>();
         float width;
     }
-    private final List<Stroke> strokes = new ArrayList<>();
+    private final List<Stroke> strokes = new ArrayList<>(); // data only (y-extent, emptiness)
     private Stroke current;
     private final Paint inkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint replyPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint eraserPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint bitmapPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint alphaBitmapPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Path reusePath = new Path();
 
     // --- state ---
     private State state = State.READY;
-    private float drinkAlpha = 1f;      // user ink alpha (DRINKING)
-    private float replyAlpha = 1f;      // reply ink alpha
+    private float drinkAlpha = 1f;      // page ink alpha (DRINKING)
+    private float replyAlpha = 1f;      // settled reply ink alpha (finishing)
     private long thinkStart;            // THINKING indicator phase
     private final ExecutorService synth = Executors.newSingleThreadExecutor();
 
@@ -111,7 +137,9 @@ public class DiaryView extends View {
         replyPaint.setStyle(Paint.Style.STROKE);
         replyPaint.setStrokeCap(Paint.Cap.ROUND);
         replyPaint.setStrokeJoin(Paint.Join.ROUND);
-        setBackgroundColor(0xFFFBFAF6); // aged paper
+        eraserPaint.setStyle(Paint.Style.FILL);
+        eraserPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+        setBackgroundColor(0xFFFAF7EF); // paper fallback while bitmaps build
         setFocusable(true);
 
         drinkAnim = ValueAnimator.ofFloat(1f, 0f);
@@ -124,6 +152,8 @@ public class DiaryView extends View {
             @Override public void onAnimationEnd(Animator an) {
                 Bitmap page = renderPage();
                 strokes.clear();
+                if (pageCv != null) pageCv.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
+                hasInk = false;
                 drinkAlpha = 1f;
                 state = State.THINKING;
                 thinkStart = SystemClock.uptimeMillis();
@@ -219,6 +249,7 @@ public class DiaryView extends View {
                 if (!inkQueue.isEmpty() || inking != null) return; // raced with new ink
                 inkQueue.clear();
                 inking = null;
+                if (replyCv != null) replyCv.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
                 replyAlpha = 1f;
                 replyCursorY = 0;
                 streamDone = false;
@@ -256,8 +287,117 @@ public class DiaryView extends View {
         Canvas c = new Canvas(bmp);
         c.drawColor(Color.WHITE);
         c.scale(scale, scale);
-        drawStrokes(c, strokes, inkPaint, 1f);
+        if (pageBmp != null) c.drawBitmap(pageBmp, 0, 0, bitmapPaint);
         return bmp;
+    }
+
+    /** Settle one finished stroke into pageBmp (O(stroke), once). */
+    private void settleStroke(Stroke s) {
+        if (pageCv == null || s.pts.isEmpty()) return;
+        inkPaint.setAlpha(255);
+        if (s.pts.size() == 1) {
+            PointF p = s.pts.get(0);
+            inkPaint.setStrokeWidth(s.width);
+            pageCv.drawPoint(p.x, p.y, inkPaint);
+            return;
+        }
+        inkPaint.setStrokeWidth(s.width);
+        reusePath.rewind();
+        reusePath.moveTo(s.pts.get(0).x, s.pts.get(0).y);
+        for (int i = 1; i < s.pts.size(); i++)
+            reusePath.lineTo(s.pts.get(i).x, s.pts.get(i).y);
+        pageCv.drawPath(reusePath, inkPaint);
+    }
+
+    /** Settle a completed reply group into replyBmp (drawn once, not per frame). */
+    private void settleGroup(InkGroup g) {
+        if (replyCv == null) return;
+        int a = Math.round(255 * (g.faded ? 0.36f : 1f));
+        if (a == 0) return;
+        replyPaint.setAlpha(a);
+        drawGroupInto(replyCv, g, g.len);
+    }
+
+    // ---------------------------------------------------------------------
+    // Paper background (rebuilt only when the view size changes)
+    // ---------------------------------------------------------------------
+
+    private void buildBackground(int w, int h) {
+        bgBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        bgCv = new Canvas(bgBmp);
+        bgCv.drawColor(0xFFFAF7EF); // warm ivory
+
+        // paper grain: 128px tile of faint speckle, tiled over the page
+        Bitmap tile = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888);
+        Random rnd = new Random(42);
+        for (int i = 0; i < 900; i++) {
+            int x = rnd.nextInt(128), y = rnd.nextInt(128);
+            int a = 6 + rnd.nextInt(10);
+            boolean dark = rnd.nextBoolean();
+            tile.setPixel(x, y, dark ? Color.argb(a, 96, 88, 72)
+                                     : Color.argb(a, 255, 255, 255));
+        }
+        Paint grain = new Paint(Paint.FILTER_BITMAP_FLAG);
+        grain.setShader(new BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT));
+        bgCv.drawRect(0, 0, w, h, grain);
+        tile.recycle();
+
+        // horizontal rules (skip the top band where the date lives)
+        float gap = 28f * density;
+        Paint rule = new Paint();
+        rule.setColor(0xFFE9E3D3);
+        rule.setStrokeWidth(Math.max(1f, density));
+        float first = h * 0.16f;
+        for (float y = first; y < h - 8f * density; y += gap)
+            bgCv.drawLine(10f * density, y, w - 10f * density, y, rule);
+
+        // double red margin line on the left page
+        Paint red = new Paint();
+        red.setColor(0x88E4AEB0);
+        red.setStrokeWidth(Math.max(1f, density));
+        float mx1 = 64f * density, mx2 = 66.5f * density;
+        bgCv.drawLine(mx1, 0, mx1, h, red);
+        bgCv.drawLine(mx2, 0, mx2, h, red);
+
+        // centre gutter: shadow gradients on both pages + binding line
+        float cx = w / 2f;
+        float gw = 22f * density;
+        Paint gl = new Paint();
+        gl.setShader(new LinearGradient(cx - gw, 0, cx, 0,
+            0x18000000, 0x00000000, Shader.TileMode.CLAMP));
+        bgCv.drawRect(cx - gw, 0, cx, h, gl);
+        Paint gr = new Paint();
+        gr.setShader(new LinearGradient(cx, 0, cx + gw, 0,
+            0x00000000, 0x0A000000, Shader.TileMode.CLAMP));
+        bgCv.drawRect(cx, 0, cx + gw, h, gr);
+        Paint gut = new Paint();
+        gut.setColor(0xFFCFC7B3);
+        gut.setStrokeWidth(Math.max(1.5f, 1.2f * density));
+        bgCv.drawLine(cx, 0, cx, h, gut);
+
+        // binding holes down the far-left edge
+        Paint holeFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        holeFill.setColor(0xFFEFEADC);
+        Paint holeEdge = new Paint(Paint.ANTI_ALIAS_FLAG);
+        holeEdge.setStyle(Paint.Style.STROKE);
+        holeEdge.setStrokeWidth(Math.max(1f, 0.8f * density));
+        holeEdge.setColor(0xFFD5CEBB);
+        int holes = 6;
+        float hx = 15f * density, hr = 4.5f * density;
+        for (int i = 0; i < holes; i++) {
+            float hy = h * (0.12f + 0.76f * i / (holes - 1f));
+            bgCv.drawCircle(hx, hy, hr, holeFill);
+            bgCv.drawCircle(hx, hy, hr, holeEdge);
+        }
+
+        // date header, top right
+        Paint dp = new Paint(Paint.ANTI_ALIAS_FLAG);
+        dp.setColor(0xFFB4AC97);
+        dp.setTextSize(14f * density);
+        dp.setTextAlign(Paint.Align.RIGHT);
+        String date = new SimpleDateFormat("yyyy年M月d日 · E", Locale.CHINESE)
+            .format(new Date());
+        bgCv.drawText(date, w - 20f * density, h * 0.075f + dp.getTextSize() / 2f, dp);
     }
 
     // ---------------------------------------------------------------------
@@ -269,10 +409,66 @@ public class DiaryView extends View {
         super.onDraw(c);
         if (state == State.CONJURING) { drawConjured(c); return; }
 
-        drawStrokes(c, strokes, inkPaint, drinkAlpha);
+        if (bgBmp != null) c.drawBitmap(bgBmp, 0, 0, bitmapPaint);
+
+        // this round's user ink (fades while drinking)
+        if (pageBmp != null && hasInk) {
+            if (state == State.DRINKING && drinkAlpha < 1f) {
+                alphaBitmapPaint.setAlpha(Math.round(255 * drinkAlpha));
+                c.drawBitmap(pageBmp, 0, 0, alphaBitmapPaint);
+                alphaBitmapPaint.setAlpha(255);
+            } else {
+                c.drawBitmap(pageBmp, 0, 0, bitmapPaint);
+            }
+        }
+
+        // settled reply ink (fades as a whole while finishing)
+        if (replyBmp != null) {
+            boolean fading = replyAlpha < 1f;
+            if (fading) {
+                alphaBitmapPaint.setAlpha(Math.round(255 * replyAlpha));
+                c.drawBitmap(replyBmp, 0, 0, alphaBitmapPaint);
+                alphaBitmapPaint.setAlpha(255);
+            } else {
+                c.drawBitmap(replyBmp, 0, 0, bitmapPaint);
+            }
+        }
+
         if (state == State.THINKING) drawThinking(c);
         if (state == State.INKING) advanceAndDrawReply(c);
         else if (inking != null || !inkQueue.isEmpty()) drawReply(c);
+
+        // the stroke currently under the finger — the only live Path
+        if (current != null && !current.pts.isEmpty()) drawLiveStroke(c);
+
+        // empty-page hint
+        if (state == State.READY && !hinted && strokes.isEmpty()
+            && inking == null && inkQueue.isEmpty() && replyCursorY == 0) {
+            Paint hp = new Paint(Paint.ANTI_ALIAS_FLAG);
+            hp.setColor(0xFFC9C1AE);
+            hp.setTextSize(19f * density);
+            c.drawText("在这里写点什么…", 76f * density, h0() + hp.getTextSize(), hp);
+            hinted = true;
+        }
+    }
+
+    private float h0() { return getHeight() * 0.16f + 20f * density; }
+
+    private void drawLiveStroke(Canvas c) {
+        inkPaint.setAlpha(255);
+        Stroke s = current;
+        if (s.pts.size() == 1) {
+            PointF p = s.pts.get(0);
+            inkPaint.setStrokeWidth(s.width);
+            c.drawPoint(p.x, p.y, inkPaint);
+            return;
+        }
+        inkPaint.setStrokeWidth(s.width);
+        reusePath.rewind();
+        reusePath.moveTo(s.pts.get(0).x, s.pts.get(0).y);
+        for (int i = 1; i < s.pts.size(); i++)
+            reusePath.lineTo(s.pts.get(i).x, s.pts.get(i).y);
+        c.drawPath(reusePath, inkPaint);
     }
 
     /** Three pulsing ink dots while the oracle is thinking. */
@@ -293,30 +489,6 @@ public class DiaryView extends View {
         postInvalidateDelayed(50);
     }
 
-    private final Path reusePath = new Path();
-
-    private void drawStrokes(Canvas c, List<Stroke> list, Paint paint, float alpha) {
-        if (alpha <= 0.01f) return;
-        int a = Math.round(255 * alpha);
-        paint.setAlpha(a);
-        Path path = reusePath;
-        for (Stroke s : list) {
-            if (s.pts.size() < 2) {
-                if (s.pts.size() == 1) {
-                    paint.setStrokeWidth(s.width);
-                    PointF p = s.pts.get(0);
-                    c.drawPoint(p.x, p.y, paint);
-                }
-                continue;
-            }
-            paint.setStrokeWidth(s.width);
-            path.rewind();
-            path.moveTo(s.pts.get(0).x, s.pts.get(0).y);
-            for (int i = 1; i < s.pts.size(); i++) path.lineTo(s.pts.get(i).x, s.pts.get(i).y);
-            c.drawPath(path, paint);
-        }
-    }
-
     private void advanceAndDrawReply(Canvas c) {
         long now = System.nanoTime();
         if (lastFrameNs == 0) lastFrameNs = now;
@@ -326,57 +498,54 @@ public class DiaryView extends View {
         if (inking == null && !inkQueue.isEmpty()) inking = inkQueue.remove(0);
         if (inking != null) {
             inking.drawn += inkSpeed * dt;
-            if (inking.done()) inking = null;
+            if (inking.done()) {
+                settleGroup(inking);   // done sentences never redraw again
+                inking = null;
+            }
         }
         drawReply(c);
         if (inking == null) maybeScheduleFinish();
         else invalidate();
     }
 
-    /** Draw all pending + current reply ink up to the drawn length. */
+    /** Draw the sentence being written (only up to the drawn length). */
     private void drawReply(Canvas c) {
-        if (inking == null && inkQueue.isEmpty()) return;
-        List<InkGroup> all = new ArrayList<>();
-        if (inking != null) all.add(inking);
-        all.addAll(inkQueue);
-        for (InkGroup g : all) {
-            int a = Math.round(255 * replyAlpha * (g.faded ? 0.36f : 1f));
-            if (a == 0) continue;
-            replyPaint.setAlpha(a);
-            drawGroup(c, g, g == inking ? g.drawn : g.len);
-        }
+        if (inking == null) return;
+        int a = Math.round(255 * replyAlpha * (inking.faded ? 0.36f : 1f));
+        if (a == 0) return;
+        replyPaint.setAlpha(a);
+        drawGroupInto(c, inking, inking.drawn);
     }
 
-    private void drawGroup(Canvas c, InkGroup g, float upTo) {
+    /** Render one group's strokes up to path-length {@code upTo}. */
+    private void drawGroupInto(Canvas c, InkGroup g, float upTo) {
+        if (upTo <= 0) return;
         float acc = 0;
-        Path path = new Path();
+        Path path = reusePath;
         for (Handwriting.Line line : g.lines) {
             for (List<PointF> stroke : line.strokes) {
                 if (stroke.size() < 2) continue;
                 replyPaint.setStrokeWidth(Math.max(1.6f, density * 0.9f));
                 path.rewind();
                 path.moveTo(stroke.get(0).x, stroke.get(0).y);
-                boolean penDown = upTo <= 0;
                 for (int i = 1; i < stroke.size(); i++) {
                     float seg = dist(stroke.get(i - 1), stroke.get(i));
-                    if (!penDown) {
-                        float remain = upTo - acc;
-                        if (remain <= 0) break;
-                        if (remain < seg) {
-                            float t = remain / seg;
-                            float x = stroke.get(i - 1).x + (stroke.get(i).x - stroke.get(i - 1).x) * t;
-                            float y = stroke.get(i - 1).y + (stroke.get(i).y - stroke.get(i - 1).y) * t;
-                            path.lineTo(x, y);
-                            acc = upTo;
-                            break;
-                        }
-                        acc += seg;
+                    float remain = upTo - acc;
+                    if (remain <= 0) return;
+                    if (remain < seg) {
+                        float t = remain / seg;
+                        float x = stroke.get(i - 1).x
+                            + (stroke.get(i).x - stroke.get(i - 1).x) * t;
+                        float y = stroke.get(i - 1).y
+                            + (stroke.get(i).y - stroke.get(i - 1).y) * t;
+                        path.lineTo(x, y);
+                        c.drawPath(path, replyPaint);
+                        return;
                     }
+                    acc += seg;
                     path.lineTo(stroke.get(i).x, stroke.get(i).y);
-                    if (acc >= upTo) break;
                 }
                 c.drawPath(path, replyPaint);
-                if (acc >= upTo) return;
             }
         }
     }
@@ -457,6 +626,7 @@ public class DiaryView extends View {
                 removeCallbacks(commitRunnable);
                 downTime = SystemClock.uptimeMillis();
                 downX = x; downY = y;
+                lastX = x; lastY = y;
                 moved = false;
                 twoTapPending = false;
                 float corner = CORNER_TAP_DP * density;
@@ -476,7 +646,9 @@ public class DiaryView extends View {
                     break;
                 }
                 if (dist(x, y, downX, downY) > MOVE_TOL_DP * density) moved = true;
-                float dirtyL = x, dirtyT = y, dirtyR = x, dirtyB = y;
+                // dirty box: every point of this batch + previous sample + margin
+                float dirtyL = Math.min(x, lastX), dirtyT = Math.min(y, lastY);
+                float dirtyR = Math.max(x, lastX), dirtyB = Math.max(y, lastY);
                 for (int i = 0; i < e.getHistorySize() + 1; i++) {
                     float hx = i < e.getHistorySize() ? e.getHistoricalX(i) : x;
                     float hy = i < e.getHistorySize() ? e.getHistoricalY(i) : y;
@@ -486,7 +658,8 @@ public class DiaryView extends View {
                     dirtyL = Math.min(dirtyL, hx); dirtyT = Math.min(dirtyT, hy);
                     dirtyR = Math.max(dirtyR, hx); dirtyB = Math.max(dirtyB, hy);
                 }
-                float pad = 32f * density;
+                lastX = x; lastY = y;
+                float pad = eraserMode ? er() + 8f * density : 32f * density;
                 invalidate((int) (dirtyL - pad), (int) (dirtyT - pad),
                     (int) (dirtyR + pad), (int) (dirtyB + pad));
                 break;
@@ -510,7 +683,8 @@ public class DiaryView extends View {
                     invalidate();
                     break;
                 }
-                finishStroke();
+                if (eraserMode) current = null;   // erasing leaves no dot
+                else finishStroke();
                 if (!strokes.isEmpty()) postDelayed(commitRunnable, IDLE_COMMIT_MS);
                 break;
             }
@@ -534,6 +708,7 @@ public class DiaryView extends View {
         current = new Stroke();
         current.pts.add(new PointF(x, y));
         current.width = baseWidth(p);
+        hinted = true;
     }
 
     private void extendStroke(float x, float y, float p) {
@@ -545,7 +720,11 @@ public class DiaryView extends View {
     }
 
     private void finishStroke() {
-        if (current != null && current.pts.size() >= 1) strokes.add(current);
+        if (current != null && !current.pts.isEmpty()) {
+            strokes.add(current);
+            settleStroke(current);       // drawn once into pageBmp
+            hasInk = true;
+        }
         current = null;
     }
 
@@ -555,14 +734,27 @@ public class DiaryView extends View {
 
     private void eraseAt(float x, float y) {
         float r = er();
+        if (pageCv != null) pageCv.drawCircle(x, y, r, eraserPaint);
         boolean any = false;
-        for (Iterator<Stroke> it = strokes.iterator(); it.hasNext(); ) {
-            Stroke s = it.next();
+        for (int si = strokes.size() - 1; si >= 0; si--) {
+            Stroke s = strokes.get(si);
             for (PointF p : s.pts) {
-                if (dist(p.x, p.y, x, y) < r) { it.remove(); any = true; break; }
+                if (dist(p.x, p.y, x, y) < r) { strokes.remove(si); any = true; break; }
             }
         }
-        if (any) invalidate();
+        if (any && strokes.isEmpty()) hasInk = pageHasVisibleInk();
+    }
+
+    /** Cheap emptiness check after erasing (bitmap may still hold fragments). */
+    private boolean pageHasVisibleInk() {
+        if (pageBmp == null) return false;
+        int w = pageBmp.getWidth(), h = pageBmp.getHeight();
+        int[] row = new int[Math.min(w, 64)];
+        for (int y = 0; y < h; y += 16) {
+            pageBmp.getPixels(row, 0, row.length, 0, y, row.length, 1);
+            for (int px : row) if ((px & 0xFF000000) != 0) return true;
+        }
+        return false;
     }
 
     private static float dist(PointF a, PointF b) {
@@ -581,5 +773,22 @@ public class DiaryView extends View {
         replyStartY = h * 0.42f;
         replyCursorY = 0;
         inkSpeed = 420f * density;
+
+        if (w <= 0 || h <= 0) return;
+        buildBackground(w, h);
+        pageBmp = migrate(pageBmp, w, h);
+        pageCv = new Canvas(pageBmp);
+        replyBmp = migrate(replyBmp, w, h);
+        replyCv = new Canvas(replyBmp);
+    }
+
+    /** Recreate a layer at a new size, carrying over existing pixels. */
+    private Bitmap migrate(Bitmap old, int w, int h) {
+        Bitmap nb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        if (old != null) {
+            new Canvas(nb).drawBitmap(old, 0, 0, null);
+            old.recycle();
+        }
+        return nb;
     }
 }
