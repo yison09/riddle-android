@@ -60,6 +60,7 @@ public class DiaryView extends View {
     private State state = State.READY;
     private float drinkAlpha = 1f;      // user ink alpha (DRINKING)
     private float replyAlpha = 1f;      // reply ink alpha
+    private long thinkStart;            // THINKING indicator phase
     private final ExecutorService synth = Executors.newSingleThreadExecutor();
 
     // --- reply ink ---
@@ -125,6 +126,7 @@ public class DiaryView extends View {
                 strokes.clear();
                 drinkAlpha = 1f;
                 state = State.THINKING;
+                thinkStart = SystemClock.uptimeMillis();
                 invalidate();
                 if (host != null) host.onCommit(page, System.currentTimeMillis());
             }
@@ -230,6 +232,10 @@ public class DiaryView extends View {
 
     private void commit() {
         if (state != State.READY || strokes.isEmpty()) return;
+        int pts = 0;
+        for (Stroke s : strokes) pts += s.pts.size();
+        android.util.Log.i("RiddleOracle", "commit: " + strokes.size()
+            + " strokes, " + pts + " pts, page " + getWidth() + "x" + getHeight());
         // Tom answers below where you wrote.
         float maxY = 0;
         for (Stroke s : strokes)
@@ -264,15 +270,36 @@ public class DiaryView extends View {
         if (state == State.CONJURING) { drawConjured(c); return; }
 
         drawStrokes(c, strokes, inkPaint, drinkAlpha);
+        if (state == State.THINKING) drawThinking(c);
         if (state == State.INKING) advanceAndDrawReply(c);
         else if (inking != null || !inkQueue.isEmpty()) drawReply(c);
     }
+
+    /** Three pulsing ink dots while the oracle is thinking. */
+    private void drawThinking(Canvas c) {
+        float size = Math.max(6f * density, getWidth() * 0.011f);
+        float cx = getWidth() / 2f;
+        float cy = replyStartY + size * 2f;
+        long t = SystemClock.uptimeMillis() - thinkStart;
+        for (int i = 0; i < 3; i++) {
+            float phase = (t - i * 260f) / 320f;
+            float k = phase <= 0 ? 0f : (phase >= 1 ? 1f
+                : (float) (0.5 - 0.5 * Math.cos(phase * Math.PI * 2)));
+            replyPaint.setStyle(Paint.Style.FILL);
+            replyPaint.setAlpha(Math.round(255 * (0.22f + 0.5f * k)));
+            c.drawCircle(cx + (i - 1) * size * 2.8f, cy, size * (0.45f + 0.45f * k), replyPaint);
+        }
+        replyPaint.setStyle(Paint.Style.STROKE);
+        postInvalidateDelayed(50);
+    }
+
+    private final Path reusePath = new Path();
 
     private void drawStrokes(Canvas c, List<Stroke> list, Paint paint, float alpha) {
         if (alpha <= 0.01f) return;
         int a = Math.round(255 * alpha);
         paint.setAlpha(a);
-        Path path = new Path();
+        Path path = reusePath;
         for (Stroke s : list) {
             if (s.pts.size() < 2) {
                 if (s.pts.size() == 1) {
@@ -449,13 +476,19 @@ public class DiaryView extends View {
                     break;
                 }
                 if (dist(x, y, downX, downY) > MOVE_TOL_DP * density) moved = true;
+                float dirtyL = x, dirtyT = y, dirtyR = x, dirtyB = y;
                 for (int i = 0; i < e.getHistorySize() + 1; i++) {
                     float hx = i < e.getHistorySize() ? e.getHistoricalX(i) : x;
                     float hy = i < e.getHistorySize() ? e.getHistoricalY(i) : y;
                     float hp = i < e.getHistorySize() ? e.getHistoricalPressure(i) : pressure(e);
                     if (eraserMode) eraseAt(hx, hy);
                     else extendStroke(hx, hy, hp);
+                    dirtyL = Math.min(dirtyL, hx); dirtyT = Math.min(dirtyT, hy);
+                    dirtyR = Math.max(dirtyR, hx); dirtyB = Math.max(dirtyB, hy);
                 }
+                float pad = 32f * density;
+                invalidate((int) (dirtyL - pad), (int) (dirtyT - pad),
+                    (int) (dirtyR + pad), (int) (dirtyB + pad));
                 break;
             }
             case MotionEvent.ACTION_POINTER_UP: {
@@ -506,7 +539,7 @@ public class DiaryView extends View {
     private void extendStroke(float x, float y, float p) {
         if (current == null) { startStroke(x, y, p); return; }
         PointF last = current.pts.get(current.pts.size() - 1);
-        if (dist(last.x, last.y, x, y) < 1.2f) return;
+        if (dist(last.x, last.y, x, y) < 2.5f * density) return;
         current.pts.add(new PointF(x, y));
         current.width = (current.width * 3f + baseWidth(p)) / 4f;
     }

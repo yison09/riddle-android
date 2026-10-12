@@ -1,5 +1,6 @@
 package com.riddle.diary;
 
+import android.graphics.Bitmap;
 import android.util.Base64;
 import android.util.Log;
 
@@ -7,6 +8,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -73,7 +75,7 @@ public class Oracle {
     }
 
     public static final class Turn {
-        public byte[] png;
+        public android.graphics.Bitmap page;
         public List<String> catalogLines = new ArrayList<>();
         public List<Long> catalogIds = new ArrayList<>();
         /** (transcript, reply) pairs, oldest first. */
@@ -98,6 +100,10 @@ public class Oracle {
     }
 
     private void run(Turn turn, Listener l) throws Exception {
+        if (cfg.key == null || cfg.key.trim().isEmpty()) {
+            l.onError("no API key — tap the top-right corner and paste your key");
+            return;
+        }
         String system = cfg.remember ? PERSONA + MEMORY_PROTOCOL : PERSONA;
 
         JSONArray messages = new JSONArray();
@@ -110,33 +116,84 @@ public class Oracle {
             ? "Reply to what is written in the diary."
             : "Memory catalog (newest first):\n" + String.join("\n", turn.catalogLines)
                 + "\n\nReply to what is written in the diary.";
-        String img = Base64.encodeToString(turn.png, Base64.NO_WRAP);
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        if (turn.page != null) turn.page.compress(Bitmap.CompressFormat.PNG, 90, bos);
+        byte[] png = bos.toByteArray();
+        String img = Base64.encodeToString(png, Base64.NO_WRAP);
         JSONArray content = new JSONArray();
         content.put(new JSONObject().put("type", "text").put("text", userText));
         content.put(new JSONObject().put("type", "image_url")
             .put("image_url", new JSONObject().put("url", "data:image/png;base64," + img)));
         messages.put(new JSONObject().put("role", "user").put("content", content));
+        Log.i(TAG, "POST " + cfg.base.replaceAll("/+$", "") + "/chat/completions"
+            + " model=" + cfg.model + " png=" + png.length + "B"
+            + " hist=" + turn.history.size() + " catalog=" + turn.catalogLines.size()
+            + " maxTokens=" + cfg.maxTokens);
 
-        // Widely-supported token cap first; retry once if corrected.
-        HttpURLConnection conn = request(messages, "max_tokens");
-        int code = conn.getResponseCode();
-        if (code == 400) {
-            String detail = readAll(conn.getErrorStream());
-            if (detail.contains("max_completion_tokens")) {
-                Log.i(TAG, "endpoint wants max_completion_tokens; retrying");
-                conn = request(messages, "max_completion_tokens");
+        // Widely-supported token cap first; some endpoints demand
+        // max_completion_tokens, switch once when corrected. Flaky relays
+        // (5xx / timeouts) get a couple of gentle retries with backoff.
+        String capField = "max_tokens";
+        boolean switchedCap = false;
+        Exception last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                Log.i(TAG, "retry #" + attempt + " after transient failure: " + last);
+                Thread.sleep(1500L * attempt);
+            }
+            HttpURLConnection conn;
+            try {
+                conn = request(messages, capField);
+            } catch (Exception e) { last = e; continue; }
+            int code;
+            try {
                 code = conn.getResponseCode();
-            } else {
-                l.onError("http 400: " + detail.trim());
+            } catch (Exception e) { last = e; continue; }
+
+            if (code == 200) {
+                stream(conn.getInputStream(), turn.catalogIds, l);
                 return;
             }
-        }
-        if (code != 200) {
             String detail = readAll(conn.getErrorStream());
-            l.onError("http " + code + ": " + detail.trim());
-            return;
+            if (code == 400 && !switchedCap && detail.contains("max_completion_tokens")) {
+                Log.i(TAG, "endpoint wants max_completion_tokens; retrying");
+                switchedCap = true;
+                capField = "max_completion_tokens";
+                attempt--;
+                continue;
+            }
+            if (code == 400 || code == 401 || code == 403 || code == 404) {
+                String msg = friendlyError(code, detail);
+                Log.e(TAG, msg);
+                l.onError(msg);
+                return; // permanent — don't retry
+            }
+            Log.e(TAG, "transient http " + code + " (attempt " + (attempt + 1) + ")");
+            last = new Exception("http " + code + ": " + detail);
         }
-        stream(conn.getInputStream(), turn.catalogIds, l);
+        String msg = last == null ? "no response from the oracle"
+            : friendlyError(0, last.getMessage() == null ? String.valueOf(last) : last.getMessage());
+        Log.e(TAG, "oracle gave up: " + msg);
+        l.onError(msg);
+    }
+
+    /** Short human-readable error; relay HTML pages are just noise. */
+    static String friendlyError(int code, String detail) {
+        String d = detail == null ? "" : detail.trim();
+        String prefix = code > 0 ? "http " + code + ": " : "";
+        if (d.contains("DOCTYPE") || d.contains("<html") || d.contains("<!doctype")) {
+            return prefix + "upstream gateway error (the relay is down or busy)";
+        }
+        try {
+            JSONObject err = new JSONObject(d).optJSONObject("error");
+            if (err != null) {
+                String m = err.optString("message", "");
+                if (!m.isEmpty() && !m.contains("DOCTYPE")) d = m;
+            }
+        } catch (Exception ignored) { }
+        if (d.length() > 160) d = d.substring(0, 160) + "…";
+        return prefix + d;
     }
 
     private HttpURLConnection request(JSONArray messages, String capField) throws Exception {
@@ -151,7 +208,7 @@ public class Oracle {
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
         conn.setConnectTimeout(10_000);
-        conn.setReadTimeout(90_000);
+        conn.setReadTimeout(45_000);
         conn.setDoOutput(true);
         conn.setRequestProperty("Authorization", "Bearer " + cfg.key);
         conn.setRequestProperty("Content-Type", "application/json");

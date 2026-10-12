@@ -16,7 +16,6 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.ByteArrayOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -55,12 +54,22 @@ public class MainActivity extends Activity implements DiaryView.Host {
 
         memory = new MemoryStore(this);
         oracle = new Oracle(config());
+
+        // First run: the diary is sealed until an API key is provided
+        // (prompt once, after the window is attached).
+        sealedPrompt = config().key.trim().isEmpty();
     }
+
+    private boolean sealedPrompt;
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) hideSystemUi();
+        if (hasFocus && sealedPrompt) {
+            sealedPrompt = false;
+            showSettings();
+        }
     }
 
     private void hideSystemUi() {
@@ -81,11 +90,15 @@ public class MainActivity extends Activity implements DiaryView.Host {
         fullReply.setLength(0);
         lastTranscript = null;
 
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        page.compress(Bitmap.CompressFormat.PNG, 90, bos);
+        if (config().key.trim().isEmpty()) {
+            diary.enqueueSentence("The diary is sealed — tap the top-right corner to set the API key.");
+            diary.replyFinished();
+            Toast.makeText(this, "尚未配置 API Key：轻点右上角打开设置", Toast.LENGTH_LONG).show();
+            return;
+        }
 
         Oracle.Turn turn = new Oracle.Turn();
-        turn.png = bos.toByteArray();
+        turn.page = page;
         if (config().remember) {
             turn.catalogLines = memory.catalogLines();
             turn.catalogIds = memory.catalogIds();
@@ -108,15 +121,21 @@ public class MainActivity extends Activity implements DiaryView.Host {
             }
             @Override public void onTranscript(String text) { lastTranscript = text; }
             @Override public void onDone() {
-                if (config().remember) {
-                    String reply = fullReply.toString().trim();
+                String reply = fullReply.toString().trim();
+                boolean ok = config().remember && !reply.isEmpty()
+                    && !reply.startsWith("The ink blurred");
+                if (ok) {
                     String transcript = lastTranscript != null ? lastTranscript : "";
                     memory.add(commitTs, transcript, reply, page);
                 }
                 diary.replyFinished();
             }
             @Override public void onError(String message) {
-                diary.enqueueSentence("The ink blurred — " + message);
+                android.util.Log.e("RiddleOracle", "oracle error: " + message);
+                String shortMsg = message.length() > 240 ? message.substring(0, 240) + "…" : message;
+                runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                    "请求失败：" + shortMsg, Toast.LENGTH_LONG).show());
+                diary.enqueueSentence("The ink blurred — " + shortMsg);
             }
         });
     }
@@ -152,7 +171,8 @@ public class MainActivity extends Activity implements DiaryView.Host {
         box.setPadding(pad, pad / 2, pad, 0);
 
         TextView hint = new TextView(this);
-        hint.setText("写下字后停笔约 3 秒：日记吸墨，Tom 用花体回信。\n"
+        hint.setText("首次使用必须填写 API Base URL、API Key、Model（需支持图像输入），\n"
+            + "否则日记无法回信。写下字后停笔约 3 秒：日记吸墨，Tom 用花体回信。\n"
             + "双指点按 = 橡皮擦。写下 \"show me …\" 召回旧页。");
         hint.setTextSize(13);
         hint.setPadding(0, 0, 0, pad / 2);
