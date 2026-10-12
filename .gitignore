@@ -3,6 +3,9 @@
 build/
 local.properties
 
+# Signing (keep out of the repo — losing it breaks app updates)
+release.keystore
+
 # IDE
 .idea/
 *.iml

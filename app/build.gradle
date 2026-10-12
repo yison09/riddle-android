@@ -20,9 +20,19 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        release {
+            storeFile rootProject.file('release.keystore')
+            storePassword project.findProperty('RIDDLE_STOREPASS')
+            keyAlias 'riddle'
+            keyPassword project.findProperty('RIDDLE_STOREPASS')
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
         }
     }
 }
