@@ -67,6 +67,7 @@ public class DiaryView extends View {
     private Canvas bgCv, pageCv, replyCv;
     private boolean hasInk;    // pageBmp holds ink this round
     private boolean hinted;    // empty-page hint already shown once
+    private String bgDate = ""; // date baked into the background
 
     // --- user ink ---
     private static final class Stroke {
@@ -395,9 +396,23 @@ public class DiaryView extends View {
         dp.setColor(0xFFB4AC97);
         dp.setTextSize(14f * density);
         dp.setTextAlign(Paint.Align.RIGHT);
-        String date = new SimpleDateFormat("yyyy年M月d日 · E", Locale.CHINESE)
-            .format(new Date());
+        String date = todayStr();
+        bgDate = date;
         bgCv.drawText(date, w - 20f * density, h * 0.075f + dp.getTextSize() / 2f, dp);
+    }
+
+    private static String todayStr() {
+        return new SimpleDateFormat("yyyy年M月d日 · E", Locale.CHINESE).format(new Date());
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        // If the app was left open past midnight, redraw the header with today's date.
+        if (hasFocus && bgBmp != null && getWidth() > 0 && !todayStr().equals(bgDate)) {
+            buildBackground(getWidth(), getHeight());
+            invalidate();
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -596,7 +611,7 @@ public class DiaryView extends View {
     // ---------------------------------------------------------------------
 
     private float lastX, lastY;
-    private boolean twoTapPending;
+    private boolean twoFingerTap;
     private boolean moved;
     private long downTime;
     private float downX, downY;
@@ -608,6 +623,12 @@ public class DiaryView extends View {
     @Override
     public boolean onTouchEvent(MotionEvent e) {
         float x = e.getX(), y = e.getY();
+        int act = e.getActionMasked();
+        if (act != MotionEvent.ACTION_MOVE) {
+            android.util.Log.i("RiddleTouch", "act=" + act + " ptrs=" + e.getPointerCount()
+                + " (" + Math.round(x) + "," + Math.round(y) + ") eraser=" + eraserMode
+                + " state=" + state);
+        }
 
         if (state == State.CONJURING) {
             if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
@@ -628,16 +649,17 @@ public class DiaryView extends View {
                 downX = x; downY = y;
                 lastX = x; lastY = y;
                 moved = false;
-                twoTapPending = false;
+                twoFingerTap = false;
                 float corner = CORNER_TAP_DP * density;
                 cornerTap = x > getWidth() - corner && y < corner;
                 if (!cornerTap) startStroke(x, y, pressure(e));
                 return true;
             }
             case MotionEvent.ACTION_POINTER_DOWN: {
-                moved = true; // a second finger lands: not a clean tap, and no ink from it
+                // A second finger lands: drop the live stroke (no ink from it),
+                // and remember this as a two-finger-tap candidate if fingers stay still.
+                twoFingerTap = !cornerTap && current != null;
                 if (current != null) { current = null; }
-                twoTapPending = !cornerTap;
                 return true;
             }
             case MotionEvent.ACTION_MOVE: {
@@ -665,7 +687,16 @@ public class DiaryView extends View {
                 break;
             }
             case MotionEvent.ACTION_POINTER_UP: {
-                twoTapPending = false;
+                break; // fingers are lifting; ACTION_UP makes the final call
+            }
+            case MotionEvent.ACTION_CANCEL: {
+                // Interrupted (call, dialog, gesture nav): settle the live stroke
+                // so it isn't left dangling and the page can still commit.
+                if (!eraserMode) finishStroke();
+                else current = null;
+                twoFingerTap = false;
+                cornerTap = false;
+                if (!strokes.isEmpty()) postDelayed(commitRunnable, IDLE_COMMIT_MS);
                 break;
             }
             case MotionEvent.ACTION_UP: {
@@ -674,9 +705,9 @@ public class DiaryView extends View {
                     if (!moved && host != null) host.onSettingsTap();
                     break;
                 }
-                boolean wasTwoTap = twoTapPending && !moved
+                boolean wasTwoTap = twoFingerTap && !moved
                     && SystemClock.uptimeMillis() - downTime < 400;
-                twoTapPending = false;
+                twoFingerTap = false;
                 if (wasTwoTap) {
                     eraserMode = !eraserMode;
                     current = null;
