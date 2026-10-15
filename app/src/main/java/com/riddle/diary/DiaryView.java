@@ -182,8 +182,12 @@ public class DiaryView extends View {
         final float size = Math.max(28f, getWidth() * 0.052f);
         final float maxWidth = getWidth() - 48f * density;
         synth.execute(() -> {
+            long t0 = SystemClock.uptimeMillis();
             List<Handwriting.Line> lines = Handwriting.synthesize(
                 text, typeface, size, maxWidth, 24f * density, 0f);
+            long dt = SystemClock.uptimeMillis() - t0;
+            android.util.Log.i("RiddleOracle", "synthesize " + dt + "ms lines=" + lines.size()
+                + " chars=" + text.length());
             post(() -> {
                 if (lines.isEmpty()) return;
                 if (endAnimator != null) { endAnimator.cancel(); endAnimator = null; }
