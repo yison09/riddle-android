@@ -16,6 +16,9 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -54,6 +57,7 @@ public class MainActivity extends Activity implements DiaryView.Host {
 
         memory = new MemoryStore(this);
         oracle = new Oracle(config());
+        restoreDraft();
 
         // First run: the diary is sealed until an API key is provided
         // (prompt once, after the window is attached).
@@ -108,16 +112,16 @@ public class MainActivity extends Activity implements DiaryView.Host {
         oracle.ask(turn, new Oracle.Listener() {
             @Override public void onSentence(String text) {
                 fullReply.append(text).append(' ');
-                diary.enqueueSentence(text);
+                ui(() -> diary.enqueueSentence(text));
             }
             @Override public void onShow(long id) {
                 MemoryStore.Page p = memory.byId(id);
                 if (p == null) {
-                    diary.enqueueSentence("The diary lost that page.");
+                    ui(() -> diary.enqueueSentence("The diary lost that page."));
                     return;
                 }
-                Bitmap old = memory.load(p);
-                diary.conjure(old, formatDate(p.ts), p.reply);
+                Bitmap old = memory.load(p);   // decode off the UI thread
+                ui(() -> diary.conjure(old, formatDate(p.ts), p.reply));
             }
             @Override public void onTranscript(String text) { lastTranscript = text; }
             @Override public void onDone() {
@@ -128,14 +132,16 @@ public class MainActivity extends Activity implements DiaryView.Host {
                     String transcript = lastTranscript != null ? lastTranscript : "";
                     memory.add(commitTs, transcript, reply, page);
                 }
-                diary.replyFinished();
+                ui(diary::replyFinished);
             }
             @Override public void onError(String message) {
                 android.util.Log.e("RiddleOracle", "oracle error: " + message);
                 String shortMsg = message.length() > 240 ? message.substring(0, 240) + "…" : message;
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                    "请求失败：" + shortMsg, Toast.LENGTH_LONG).show());
-                diary.enqueueSentence("The ink blurred — " + shortMsg);
+                ui(() -> {
+                    Toast.makeText(MainActivity.this, "请求失败：" + shortMsg,
+                        Toast.LENGTH_LONG).show();
+                    diary.enqueueSentence("The ink blurred — " + shortMsg);
+                });
             }
         });
     }
@@ -145,6 +151,52 @@ public class MainActivity extends Activity implements DiaryView.Host {
 
     private String formatDate(long ts) {
         return new SimpleDateFormat("MMMM d, yyyy", Locale.ENGLISH).format(new Date(ts));
+    }
+
+    /** Every oracle callback arrives on the worker thread; the diary is a view. */
+    private void ui(Runnable r) { runOnUiThread(r); }
+
+    // ---------------------------------------------------------------------
+    // Draft persistence — a half-written page survives the app being killed
+    // ---------------------------------------------------------------------
+
+    private File draftFile() { return new File(getFilesDir(), "draft.bin"); }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        try {
+            byte[] d = diary.dumpDraft();
+            if (d == null) {
+                //noinspection ResultOfMethodCallIgnored
+                draftFile().delete();
+            } else {
+                try (FileOutputStream o = new FileOutputStream(draftFile())) { o.write(d); }
+            }
+        } catch (Exception ignored) { }
+    }
+
+    private void restoreDraft() {
+        try {
+            File f = draftFile();
+            if (!f.exists() || f.length() == 0) return;
+            byte[] b = new byte[(int) f.length()];
+            try (FileInputStream in = new FileInputStream(f)) {
+                int off = 0;
+                while (off < b.length) {
+                    int r = in.read(b, off, b.length - off);
+                    if (r < 0) break;
+                    off += r;
+                }
+            }
+            diary.loadDraft(b);
+        } catch (Exception ignored) { }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (oracle != null) oracle.shutdown();
     }
 
     // ---------------------------------------------------------------------
@@ -208,7 +260,9 @@ public class MainActivity extends Activity implements DiaryView.Host {
                     reasoning.getText().toString().trim(),
                     parseInt(maxTokens.getText().toString(), 2000),
                     remember.isChecked());
+                Oracle old = oracle;
                 oracle = new Oracle(config());
+                if (old != null) old.shutdown();  // drop any request still in flight
                 Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show();
             })
             .setNegativeButton("取消", null)

@@ -21,6 +21,10 @@ import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -68,6 +72,7 @@ public class DiaryView extends View {
     private boolean hasInk;    // pageBmp holds ink this round
     private boolean hinted;    // empty-page hint already shown once
     private String bgDate = ""; // date baked into the background
+    private byte[] pendingDraft; // restored draft waiting for the first layout
 
     // --- user ink ---
     private static final class Stroke {
@@ -201,6 +206,13 @@ public class DiaryView extends View {
     public void replyFinished() {
         post(() -> {
             streamDone = true;
+            // Nothing was ever queued (empty reply, or synthesis produced no ink):
+            // leave the thinking state now instead of sitting in it forever.
+            if (state == State.THINKING && inking == null && inkQueue.isEmpty()) {
+                state = State.READY;
+                invalidate();
+                return;
+            }
             maybeScheduleFinish();
         });
     }
@@ -208,6 +220,7 @@ public class DiaryView extends View {
     /** Conjure a remembered page: it rises through the paper in faded ink. */
     public void conjure(Bitmap page, String dateText, String replyText) {
         post(() -> {
+            recycleConjured();
             conjureBmp = page;
             conjureDate = dateText == null ? "" : dateText;
             conjureReply = replyText == null ? "" : replyText;
@@ -217,6 +230,69 @@ public class DiaryView extends View {
             a.addUpdateListener(an -> { conjureAlpha = (float) an.getAnimatedValue(); invalidate(); });
             a.start();
         });
+    }
+
+    /** The decoded memory page is owned by this view; drop it when done. */
+    private void recycleConjured() {
+        if (conjureBmp != null && !conjureBmp.isRecycled()) conjureBmp.recycle();
+        conjureBmp = null;
+    }
+
+    // ---------------------------------------------------------------------
+    // Draft persistence — the page survives the app being killed
+    // ---------------------------------------------------------------------
+
+    /** Serialize the un-committed ink so a killed app can restore the page. */
+    public byte[] dumpDraft() {
+        List<Stroke> all = new ArrayList<>(strokes);
+        if (current != null && !current.pts.isEmpty()) all.add(current);
+        if (all.isEmpty()) return null;
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(bos);
+            out.writeInt(all.size());
+            for (Stroke s : all) {
+                out.writeFloat(s.width);
+                out.writeInt(s.pts.size());
+                for (PointF p : s.pts) {
+                    out.writeFloat(p.x);
+                    out.writeFloat(p.y);
+                }
+            }
+            out.flush();
+            return bos.toByteArray();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Restore a draft; safe to call before the view has been laid out. */
+    public void loadDraft(byte[] data) {
+        if (data == null || data.length == 0) return;
+        if (pageCv == null) { pendingDraft = data; return; }
+        try {
+            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
+            int n = in.readInt();
+            if (n <= 0 || n > 20000) return;
+            for (int i = 0; i < n; i++) {
+                Stroke s = new Stroke();
+                s.width = in.readFloat();
+                int cnt = in.readInt();
+                if (cnt <= 0 || cnt > 200000) return;
+                for (int k = 0; k < cnt; k++) {
+                    s.pts.add(new PointF(in.readFloat(), in.readFloat()));
+                }
+                strokes.add(s);
+                settleStroke(s);
+            }
+            hasInk = !strokes.isEmpty();
+            hinted = hasInk;
+            invalidate();
+        } catch (Exception e) {
+            strokes.clear();
+            hasInk = false;
+        }
+        pendingDraft = null;
     }
 
     // ---------------------------------------------------------------------
@@ -264,6 +340,7 @@ public class DiaryView extends View {
 
     private void commit() {
         if (state != State.READY || strokes.isEmpty()) return;
+        streamDone = false;   // a fresh turn starts here
         int pts = 0;
         for (Stroke s : strokes) pts += s.pts.size();
         android.util.Log.i("RiddleOracle", "commit: " + strokes.size()
@@ -324,8 +401,10 @@ public class DiaryView extends View {
     // ---------------------------------------------------------------------
 
     private void buildBackground(int w, int h) {
+        Bitmap old = bgBmp;
         bgBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         bgCv = new Canvas(bgBmp);
+        if (old != null && !old.isRecycled()) old.recycle();
         bgCv.drawColor(0xFFFAF7EF); // warm ivory
 
         // paper grain: 128px tile of faint speckle, tiled over the page
@@ -632,7 +711,7 @@ public class DiaryView extends View {
 
         if (state == State.CONJURING) {
             if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                conjureBmp = null;
+                recycleConjured();
                 conjureAlpha = 0;
                 state = streamDone && (inking != null || !inkQueue.isEmpty())
                     ? State.INKING : State.READY;
@@ -766,23 +845,46 @@ public class DiaryView extends View {
     private void eraseAt(float x, float y) {
         float r = er();
         if (pageCv != null) pageCv.drawCircle(x, y, r, eraserPaint);
-        boolean any = false;
+        boolean removed = false;
         for (int si = strokes.size() - 1; si >= 0; si--) {
             Stroke s = strokes.get(si);
+            boolean hit = false;
             for (PointF p : s.pts) {
-                if (dist(p.x, p.y, x, y) < r) { strokes.remove(si); any = true; break; }
+                if (dist(p.x, p.y, x, y) < r) { hit = true; break; }
             }
+            if (!hit) continue;
+            // Erase only what the eraser actually touched: keep the untouched
+            // runs of the stroke instead of dropping the whole line.
+            strokes.remove(si);
+            strokes.addAll(si, splitStroke(s, x, y, r));
+            removed = true;
         }
-        if (any && strokes.isEmpty()) hasInk = pageHasVisibleInk();
+        if (removed && strokes.isEmpty()) hasInk = pageHasVisibleInk();
     }
 
-    /** Cheap emptiness check after erasing (bitmap may still hold fragments). */
+    /** The runs of a stroke's points that lie outside the eraser. */
+    private static List<Stroke> splitStroke(Stroke s, float x, float y, float r) {
+        List<Stroke> out = new ArrayList<>();
+        Stroke cur = null;
+        for (PointF p : s.pts) {
+            if (dist(p.x, p.y, x, y) < r) { cur = null; continue; }
+            if (cur == null) {
+                cur = new Stroke();
+                cur.width = s.width;
+                out.add(cur);
+            }
+            cur.pts.add(p);
+        }
+        return out;
+    }
+
+    /** Emptiness check after erasing (the bitmap may still hold fragments). */
     private boolean pageHasVisibleInk() {
         if (pageBmp == null) return false;
         int w = pageBmp.getWidth(), h = pageBmp.getHeight();
-        int[] row = new int[Math.min(w, 64)];
+        int[] row = new int[w];
         for (int y = 0; y < h; y += 16) {
-            pageBmp.getPixels(row, 0, row.length, 0, y, row.length, 1);
+            pageBmp.getPixels(row, 0, w, 0, y, w, 1);
             for (int px : row) if ((px & 0xFF000000) != 0) return true;
         }
         return false;
@@ -811,6 +913,11 @@ public class DiaryView extends View {
         pageCv = new Canvas(pageBmp);
         replyBmp = migrate(replyBmp, w, h);
         replyCv = new Canvas(replyBmp);
+        if (pendingDraft != null) {
+            byte[] d = pendingDraft;
+            pendingDraft = null;
+            loadDraft(d);
+        }
     }
 
     /** Recreate a layer at a new size, carrying over existing pixels. */
@@ -821,5 +928,15 @@ public class DiaryView extends View {
             old.recycle();
         }
         return nb;
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        super.onDetachedFromWindow();
+        removeCallbacks(commitRunnable);
+        removeCallbacks(finishReply);
+        if (endAnimator != null) { endAnimator.cancel(); endAnimator = null; }
+        if (drinkAnim.isRunning()) drinkAnim.cancel();
+        synth.shutdownNow();   // the synthesis worker dies with the view
     }
 }

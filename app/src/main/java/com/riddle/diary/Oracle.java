@@ -84,19 +84,31 @@ public class Oracle {
 
     private final Config cfg;
     private final ExecutorService exec = Executors.newSingleThreadExecutor();
+    private volatile boolean cancelled = false;
 
     public Oracle(Config cfg) { this.cfg = cfg; }
 
+    /** Stop the worker and silence any in-flight callbacks (the diary is gone). */
+    public void shutdown() {
+        cancelled = true;
+        exec.shutdownNow();
+    }
+
     public void ask(Turn turn, Listener l) {
-        exec.execute(() -> {
-            try {
-                run(turn, l);
-            } catch (Exception e) {
-                Log.e(TAG, "oracle failed", e);
-                l.onError("request failed: " + e.getMessage());
-            }
-            l.onDone();
-        });
+        try {
+            exec.execute(() -> {
+                if (cancelled) return;
+                try {
+                    run(turn, l);
+                } catch (Exception e) {
+                    Log.e(TAG, "oracle failed", e);
+                    if (!cancelled) l.onError("request failed: " + e.getMessage());
+                }
+                if (!cancelled) l.onDone();
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            Log.w(TAG, "oracle already shut down; request ignored");
+        }
     }
 
     private void run(Turn turn, Listener l) throws Exception {
@@ -112,10 +124,16 @@ public class Oracle {
             messages.put(msg("user", "(an earlier page) " + pair[0]));
             messages.put(msg("assistant", pair[1]));
         }
-        String userText = turn.catalogLines.isEmpty()
-            ? "Reply to what is written in the diary."
-            : "Memory catalog (newest first):\n" + String.join("\n", turn.catalogLines)
-                + "\n\nReply to what is written in the diary.";
+        String userText;
+        if (turn.catalogLines.isEmpty()) {
+            userText = "Reply to what is written in the diary.";
+        } else {
+            // String.join is API 26+; minSdk here is 23.
+            StringBuilder cat = new StringBuilder();
+            for (String line : turn.catalogLines) cat.append(line).append('\n');
+            userText = "Memory catalog (newest first):\n" + cat
+                + "\nReply to what is written in the diary.";
+        }
 
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         if (turn.page != null) turn.page.compress(Bitmap.CompressFormat.PNG, 90, bos);
@@ -219,29 +237,72 @@ public class Oracle {
     }
 
     private void stream(InputStream in, List<Long> catalogIds, Listener l) throws Exception {
-        StreamParser parser = new StreamParser(catalogIds);
         StringBuilder acc = new StringBuilder();
+        StreamParser parser = new StreamParser(catalogIds);
         try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = r.readLine()) != null) {
-                if (!line.startsWith("data:")) continue;
-                String data = line.substring(5).trim();
-                if (data.isEmpty() || "[DONE]".equals(data)) continue;
-                try {
-                    JSONObject j = new JSONObject(data);
-                    JSONArray ch = j.optJSONArray("choices");
-                    if (ch == null || ch.length() == 0) continue;
-                    String piece = ch.getJSONObject(0).optJSONObject("delta") == null ? null
-                        : ch.getJSONObject(0).getJSONObject("delta").optString("content", "");
-                    if (piece == null || piece.isEmpty()) continue;
-                    acc.append(piece);
-                    for (StreamParser.Event e : parser.advance(acc.toString(), false)) dispatch(e, l);
-                } catch (Exception e) {
-                    Log.w(TAG, "bad SSE chunk: " + data, e);
+            String line = r.readLine();
+            if (line != null && !line.startsWith("data:")) {
+                // Some relays ignore stream:true and hand back one plain JSON body.
+                StringBuilder body = new StringBuilder(line);
+                String more;
+                while ((more = r.readLine()) != null) body.append(more);
+                String text = wholeBodyContent(body.toString());
+                if (text == null) {
+                    throw new Exception("unrecognised response: "
+                        + body.substring(0, Math.min(200, body.length())));
                 }
+                for (StreamParser.Event e : parser.advance(text, true)) dispatch(e, l);
+                return;
+            }
+            while (line != null) {
+                if (line.startsWith("data:")) {
+                    String data = line.substring(5).trim();
+                    if (!data.isEmpty() && !"[DONE]".equals(data)) {
+                        try {
+                            JSONObject j = new JSONObject(data);
+                            JSONArray ch = j.optJSONArray("choices");
+                            if (ch != null && ch.length() > 0) {
+                                JSONObject d = ch.getJSONObject(0).optJSONObject("delta");
+                                String piece = d == null ? null : d.optString("content", "");
+                                if (piece != null && !piece.isEmpty()) {
+                                    acc.append(piece);
+                                    for (StreamParser.Event e : parser.advance(acc.toString(), false)) {
+                                        dispatch(e, l);
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            Log.w(TAG, "bad SSE chunk: " + data, e);
+                        }
+                    }
+                }
+                line = r.readLine();
             }
         }
         for (StreamParser.Event e : parser.advance(acc.toString(), true)) dispatch(e, l);
+    }
+
+    /** Pull the assistant text out of a non-streamed chat-completion body. */
+    private static String wholeBodyContent(String body) {
+        try {
+            JSONObject j = new JSONObject(body.trim());
+            JSONArray ch = j.optJSONArray("choices");
+            if (ch == null || ch.length() == 0) return null;
+            JSONObject c0 = ch.getJSONObject(0);
+            JSONObject m = c0.optJSONObject("message");
+            if (m != null) {
+                String s = m.optString("content", "");
+                if (!s.isEmpty()) return s;
+            }
+            JSONObject d = c0.optJSONObject("delta");
+            if (d != null) {
+                String s = d.optString("content", "");
+                if (!s.isEmpty()) return s;
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void dispatch(StreamParser.Event e, Listener l) {
@@ -342,9 +403,6 @@ public class Oracle {
                 }
                 if (sentinel >= 0 && sentinel + 1 < full.length()) {
                     String t = full.substring(sentinel + 1).trim();
-                    if (!t.isEmpty()) out.add(Event.transcript(t));
-                } else if (sentinel >= 0) {
-                    String t = "";
                     if (!t.isEmpty()) out.add(Event.transcript(t));
                 }
                 if (!emittedAny) out.add(Event.error("empty reply"));

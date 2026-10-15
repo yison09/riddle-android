@@ -147,27 +147,30 @@ public final class Handwriting {
     }
 
     /** Trace the skeleton into polyline strokes, ordered left-to-right. */
+    /** Skeleton pixel lookup (x/y may fall outside the grid). */
+    private static boolean at(boolean[] m, int w, int h, int x, int y) {
+        return x >= 0 && y >= 0 && x < w && y < h && m[y * w + x];
+    }
+
+    /** 8-neighbour count of a skeleton pixel. */
+    private static int deg(boolean[] m, int w, int h, int x, int y) {
+        int n = 0;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+                if ((dx != 0 || dy != 0) && at(m, w, h, x + dx, y + dy)) n++;
+        return n;
+    }
+
     static List<List<PointF>> trace(boolean[] m, int w, int h) {
-        java.util.function.BiPredicate<Integer, Integer> at = (x, y) ->
-            x >= 0 && y >= 0 && x < w && y < h && m[y * w + x];
-
-        java.util.function.BiFunction<Integer, Integer, Integer> deg = (x, y) -> {
-            int n = 0;
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++)
-                    if ((dx != 0 || dy != 0) && at.test(x + dx, y + dy)) n++;
-            return n;
-        };
-
         boolean[] visited = new boolean[w * h];
         // Endpoints (degree 1) first, then any remaining pixels (loops).
         List<int[]> starts = new ArrayList<>();
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
-                if (at.test(x, y) && deg.apply(x, y) == 1) starts.add(new int[]{x, y});
+                if (at(m, w, h, x, y) && deg(m, w, h, x, y) == 1) starts.add(new int[]{x, y});
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
-                if (at.test(x, y)) starts.add(new int[]{x, y});
+                if (at(m, w, h, x, y)) starts.add(new int[]{x, y});
 
         List<List<PointF>> strokes = new ArrayList<>();
         for (int[] s : starts) {
@@ -182,7 +185,7 @@ public final class Handwriting {
                 for (int dy = -1; dy <= 1 && nx < 0; dy++)
                     for (int dx = -1; dx <= 1 && nx < 0; dx++) {
                         int tx = cx + dx, ty = cy + dy;
-                        if ((dx != 0 || dy != 0) && at.test(tx, ty) && !visited[ty * w + tx]) {
+                        if ((dx != 0 || dy != 0) && at(m, w, h, tx, ty) && !visited[ty * w + tx]) {
                             nx = tx; ny = ty;
                         }
                     }
